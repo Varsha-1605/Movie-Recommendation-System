@@ -1,173 +1,122 @@
 import streamlit as st
 from PIL import Image
 import json
-from Classifier import KNearestNeighbours
+import requests
 from bs4 import BeautifulSoup
-import requests, io
+import io
 import PIL.Image
 from urllib.request import urlopen
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+import pandas as pd
+st.set_page_config(page_title="Enhanced Movie Recommender", layout="wide")
+# Load data
+@st.cache_data
+def load_data():
+    with open('./Data/movie_data.json', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    with open('./Data/movie_titles.json', 'r', encoding='utf-8') as f:
+        movie_titles = json.load(f)
+    return data, movie_titles
 
-with open('./Data/movie_data.json', 'r+', encoding='utf-8') as f:
-    data = json.load(f)
-with open('./Data/movie_titles.json', 'r+', encoding='utf-8') as f:
-    movie_titles = json.load(f)
-hdr = {'User-Agent': 'Mozilla/5.0'}
+data, movie_titles = load_data()
 
+# Create a DataFrame for easier data manipulation
+df = pd.DataFrame(data)
+df['title'] = [title[0] for title in movie_titles]
+df['imdb_link'] = [title[2] for title in movie_titles]
 
-def movie_poster_fetcher(imdb_link):
-    ## Display Movie Poster
-    url_data = requests.get(imdb_link, headers=hdr).text
-    s_data = BeautifulSoup(url_data, 'html.parser')
-    imdb_dp = s_data.find("meta", property="og:image1")
-    movie_poster_link = imdb_dp.attrs['content']
-    u = urlopen(movie_poster_link)
-    raw_data = u.read()
-    image = PIL.Image.open(io.BytesIO(raw_data))
-    image = image.resize((158, 301), )
-    st.image(image, use_column_width=False)
+# Prepare feature matrix
+feature_cols = df.columns[:-3]  # Exclude title, imdb_link, and imdb_score
+X = df[feature_cols]
 
+# Initialize NearestNeighbors model
+nn_model = NearestNeighbors(n_neighbors=21, metric='cosine')
+nn_model.fit(X)
 
-def get_movie_info(imdb_link):
-    url_data = requests.get(imdb_link, headers=hdr).text
-    s_data = BeautifulSoup(url_data, 'html.parser')
-    imdb_content = s_data.find("meta", property="og:description")
-    movie_descr = imdb_content.attrs['content']
-    movie_descr = str(movie_descr).split('.')
-    movie_director = movie_descr[0]
-    movie_cast = str(movie_descr[1]).replace('With', 'Cast: ').strip()
-    movie_story = 'Story: ' + str(movie_descr[2]).strip() + '.'
-    rating = s_data.find("span", class_="sc-bde20123-1 iZlgcd").text
-    movie_rating = 'Total Rating count: ' + str(rating)
-    return movie_director, movie_cast, movie_story, movie_rating
+def get_recommendations(query, n_recommendations=20):
+    if isinstance(query, str):
+        # If query is a movie title
+        idx = df[df['title'] == query].index[0]
+        distances, indices = nn_model.kneighbors(X.iloc[idx].values.reshape(1, -1))
+    else:
+        # If query is a feature vector
+        distances, indices = nn_model.kneighbors(np.array(query).reshape(1, -1))
+    
+    return df.iloc[indices[0][1:n_recommendations+1]]
 
+def fetch_movie_details(imdb_link):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(imdb_link, headers=headers)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Extract movie details
+        title = soup.find('h1')
+        title = title.text.strip() if title else "Title not found"
+        
+        rating_elem = soup.find('span', class_='sc-bde20123-1') or soup.find('span', class_='sc-7ab21ed2-1')
+        rating = rating_elem.text.strip() if rating_elem else "Rating not available"
+        
+        summary_elem = soup.find('span', class_='sc-466bb6c-2') or soup.find('span', attrs={"data-testid": "plot-xl"})
+        summary = summary_elem.text.strip() if summary_elem else "Summary not available"
+        
+        # Extract poster URL
+        poster_elem = soup.find('div', class_='ipc-media ipc-media--poster-27x40') or soup.find('div', class_='poster')
+        poster_url = poster_elem.find('img')['src'] if poster_elem and poster_elem.find('img') else None
+        
+        return {
+            'title': title,
+            'rating': rating,
+            'summary': summary,
+            'poster_url': poster_url
+        }
+    except Exception as e:
+        st.error(f"An error occurred while fetching movie details: {str(e)}")
+        return {
+            'title': "Error fetching details",
+            'rating': "N/A",
+            'summary': "Unable to fetch movie details. Please try again later.",
+            'poster_url': None
+        }
 
-def KNN_Movie_Recommender(test_point, k):
-    # Create dummy target variable for the KNN Classifier
-    target = [0 for item in movie_titles]
-    # Instantiate object for the Classifier
-    model = KNearestNeighbours(data, target, test_point, k=k)
-    # Run the algorithm
-    model.fit()
-    # Print list of 10 recommendations < Change value of k for a different number >
-    table = []
-    for i in model.indices:
-        # Returns back movie title and imdb link
-        table.append([movie_titles[i][0], movie_titles[i][2], data[i][-1]])
-    print(table)
-    return table
+# Update the main function to handle potential errors
+def main():
+    st.title("Enhanced Movie Recommender System")
+    st.markdown("Discover your next favorite movie!")
 
+    # Sidebar for user input
+    st.sidebar.header("Customize Your Recommendations")
+    rec_type = st.sidebar.radio("Recommendation Type", ["Movie-based", "Genre-based"])
 
-st.set_page_config(
-    page_title="Movie Recommender System",
-)
+    if rec_type == "Movie-based":
+        selected_movie = st.sidebar.selectbox("Select a movie", df['title'].tolist())
+        recommendations = get_recommendations(selected_movie)
+    else:
+        genres = feature_cols[:-1]  # Exclude imdb_score
+        selected_genres = st.sidebar.multiselect("Select genres", genres)
+        imdb_score = st.sidebar.slider("Minimum IMDb Score", 1.0, 10.0, 7.0, 0.1)
+        
+        query = [1 if genre in selected_genres else 0 for genre in genres]
+        query.append(imdb_score)
+        recommendations = get_recommendations(query)
 
-
-def run():
-    img1 = Image.open('./meta/logo.jpg')
-    img1 = img1.resize((250, 250), )
-    st.image(img1, use_column_width=False)
-    st.title("Movie Recommender System")
-    st.markdown('''<h4 style='text-align: left; color: #d73b5c;'>* Data is based "IMDB 5000 Movie Dataset"</h4>''',
-                unsafe_allow_html=True)
-    genres = ['Action', 'Adventure', 'Animation', 'Biography', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family',
-              'Fantasy', 'Film-Noir', 'Game-Show', 'History', 'Horror', 'Music', 'Musical', 'Mystery', 'News',
-              'Reality-TV', 'Romance', 'Sci-Fi', 'Short', 'Sport', 'Thriller', 'War', 'Western']
-    movies = [title[0] for title in movie_titles]
-    category = ['--Select--', 'Movie based', 'Genre based']
-    cat_op = st.selectbox('Select Recommendation Type', category)
-    if cat_op == category[0]:
-        st.warning('Please select Recommendation Type!!')
-    elif cat_op == category[1]:
-        select_movie = st.selectbox('Select movie: (Recommendation will be based on this selection)',
-                                    ['--Select--'] + movies)
-        dec = st.radio("Want to Fetch Movie Poster?", ('Yes', 'No'))
-        st.markdown(
-            '''<h4 style='text-align: left; color: #d73b5c;'>* Fetching a Movie Posters will take a time."</h4>''',
-            unsafe_allow_html=True)
-        if dec == 'No':
-            if select_movie == '--Select--':
-                st.warning('Please select Movie!!')
+    # Display recommendations
+    for _, movie in recommendations.iterrows():
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            details = fetch_movie_details(movie['imdb_link'])
+            if details['poster_url']:
+                st.image(details['poster_url'], width=200)
             else:
-                no_of_reco = st.slider('Number of movies you want Recommended:', min_value=5, max_value=20, step=1)
-                genres = data[movies.index(select_movie)]
-                test_points = genres
-                table = KNN_Movie_Recommender(test_points, no_of_reco + 1)
-                table.pop(0)
-                c = 0
-                st.success('Some of the movies from our Recommendation, have a look below')
-                for movie, link, ratings in table:
-                    c += 1
-                    director, cast, story, total_rat = get_movie_info(link)
-                    st.markdown(f"({c})[ {movie}]({link})")
-                    st.markdown(director)
-                    st.markdown(cast)
-                    st.markdown(story)
-                    st.markdown(total_rat)
-                    st.markdown('IMDB Rating: ' + str(ratings) + '⭐')
-        else:
-            if select_movie == '--Select--':
-                st.warning('Please select Movie!!')
-            else:
-                no_of_reco = st.slider('Number of movies you want Recommended:', min_value=5, max_value=20, step=1)
-                genres = data[movies.index(select_movie)]
-                test_points = genres
-                table = KNN_Movie_Recommender(test_points, no_of_reco + 1)
-                table.pop(0)
-                c = 0
-                st.success('Some of the movies from our Recommendation, have a look below')
-                for movie, link, ratings in table:
-                    c += 1
-                    st.markdown(f"({c})[ {movie}]({link})")
-                    movie_poster_fetcher(link)
-                    director, cast, story, total_rat = get_movie_info(link)
-                    st.markdown(director)
-                    st.markdown(cast)
-                    st.markdown(story)
-                    st.markdown(total_rat)
-                    st.markdown('IMDB Rating: ' + str(ratings) + '⭐')
-    elif cat_op == category[2]:
-        sel_gen = st.multiselect('Select Genres:', genres)
-        dec = st.radio("Want to Fetch Movie Poster?", ('Yes', 'No'))
-        st.markdown(
-            '''<h4 style='text-align: left; color: #d73b5c;'>* Fetching a Movie Posters will take a time."</h4>''',
-            unsafe_allow_html=True)
-        if dec == 'No':
-            if sel_gen:
-                imdb_score = st.slider('Choose IMDb score:', 1, 10, 8)
-                no_of_reco = st.number_input('Number of movies:', min_value=5, max_value=20, step=1)
-                test_point = [1 if genre in sel_gen else 0 for genre in genres]
-                test_point.append(imdb_score)
-                table = KNN_Movie_Recommender(test_point, no_of_reco)
-                c = 0
-                st.success('Some of the movies from our Recommendation, have a look below')
-                for movie, link, ratings in table:
-                    c += 1
-                    st.markdown(f"({c})[ {movie}]({link})")
-                    director, cast, story, total_rat = get_movie_info(link)
-                    st.markdown(director)
-                    st.markdown(cast)
-                    st.markdown(story)
-                    st.markdown(total_rat)
-                    st.markdown('IMDB Rating: ' + str(ratings) + '⭐')
-        else:
-            if sel_gen:
-                imdb_score = st.slider('Choose IMDb score:', 1, 10, 8)
-                no_of_reco = st.number_input('Number of movies:', min_value=5, max_value=20, step=1)
-                test_point = [1 if genre in sel_gen else 0 for genre in genres]
-                test_point.append(imdb_score)
-                table = KNN_Movie_Recommender(test_point, no_of_reco)
-                c = 0
-                st.success('Some of the movies from our Recommendation, have a look below')
-                for movie, link, ratings in table:
-                    c += 1
-                    st.markdown(f"({c})[ {movie}]({link})")
-                    movie_poster_fetcher(link)
-                    director, cast, story, total_rat = get_movie_info(link)
-                    st.markdown(director)
-                    st.markdown(cast)
-                    st.markdown(story)
-                    st.markdown(total_rat)
-                    st.markdown('IMDB Rating: ' + str(ratings) + '⭐')
+                st.write("Poster not available")
+        
+        with col2:
+            st.subheader(details['title'])
+            st.write(f"IMDb Rating: {details['rating']}")
+            st.write(details['summary'])
+            st.write(f"[View on IMDb]({movie['imdb_link']})")
 
-
-run()
+if __name__ == "__main__":
+    main()
