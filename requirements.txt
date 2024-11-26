@@ -5,3 +5,4 @@ pandas
 requests
 beautifulsoup4
 urllib3
+sklearn
